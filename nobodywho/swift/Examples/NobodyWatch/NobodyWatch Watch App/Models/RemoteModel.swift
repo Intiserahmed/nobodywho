@@ -10,7 +10,7 @@ struct RemoteModel: Decodable, Identifiable {
     let name: String
     let sizeMB: Int
     let parameterCountMillions: Int
-    let developer: String
+    let author: String
     let fileName: String
     let downloadURL: URL
 
@@ -19,7 +19,7 @@ struct RemoteModel: Decodable, Identifiable {
         case name = "modelName"
         case sizeMB = "modelSizeMB"
         case parameterCountMillions
-        case developer
+        case author
         case fileName
         case downloadURL
     }

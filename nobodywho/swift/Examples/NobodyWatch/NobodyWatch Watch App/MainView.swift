@@ -14,7 +14,9 @@ struct MainView: View {
         if session.modelLoaded {
             ChatView(session: session)
         } else {
-            LoadingView(session: session)
+            LoadingView(hasError: session.errorLoadingModel, errorMessage: "Failed to load model. Please try again.") {
+                session.loadModel()
+            }
         }
     }
 }

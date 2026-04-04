@@ -12,6 +12,10 @@ struct NobodyWatch_Watch_AppApp: App {
     var body: some Scene {
         WindowGroup {
             MainView()
+//            NavigationStack {
+//                HomeView()
+//                DownloaRdModelsView()
+//            }
         }
     }
 }
