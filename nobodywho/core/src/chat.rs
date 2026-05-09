@@ -35,8 +35,8 @@ use crate::sampler_config::read_sampler_from_metadata;
 use crate::sampler_config::{SamplerConfig, ShiftStep};
 use crate::template::{select_template, ChatTemplate, ChatTemplateContext};
 use crate::tokenizer::{
-    find_chunks_prefix_difference, ChunkId, Prompt, PromptPart, Promptable, TokenizerChunk,
-    TokenizerChunks,
+    find_chunks_prefix_difference, ChunkId, ImageEmbedding, Prompt, PromptPart, Promptable,
+    TokenizerChunk, TokenizerChunks,
 };
 use crate::tool_calling::{detect_tool_format, Tool, ToolCall, ToolFormat};
 use ahash::AHasher;
@@ -336,6 +336,16 @@ impl ChatHandle {
         output_rx
     }
 
+    pub fn ask_with_embeddings_channel(
+        &self,
+        text: String,
+        embeddings: Vec<ImageEmbedding>,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<llm::WriteOutput> {
+        let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.guard.send(ChatMsg::AskWithEmbeddings { text, embeddings, output_tx });
+        output_rx
+    }
+
     /// Send a message and collect tokens as they arrive.
     ///
     /// # Example
@@ -350,6 +360,14 @@ impl ChatHandle {
     /// ```
     pub fn ask(&self, prompt: impl Promptable) -> TokenStream {
         TokenStream::new(self.ask_channel(prompt.to_prompt()))
+    }
+
+    /// Phase 2 of two-phase inference: generate text using pre-computed image embeddings.
+    ///
+    /// The mmproj does not need to be loaded — embeddings were produced in Phase 1 via
+    /// `ProjectionModel::encode_image_to_embedding`.
+    pub fn ask_with_embeddings(&self, text: String, embeddings: Vec<ImageEmbedding>) -> TokenStream {
+        TokenStream::new(self.ask_with_embeddings_channel(text, embeddings))
     }
 
     fn set_and_wait_blocking<F>(&self, make_msg: F) -> Option<()>
@@ -603,6 +621,21 @@ impl ChatHandleAsync {
         let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
         self.guard.send(ChatMsg::Ask { prompt, output_tx });
         output_rx
+    }
+
+    pub fn ask_with_embeddings_channel(
+        &self,
+        text: String,
+        embeddings: Vec<ImageEmbedding>,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<llm::WriteOutput> {
+        let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.guard.send(ChatMsg::AskWithEmbeddings { text, embeddings, output_tx });
+        output_rx
+    }
+
+    /// Phase 2 of two-phase inference: generate text using pre-computed image embeddings.
+    pub fn ask_with_embeddings(&self, text: String, embeddings: Vec<ImageEmbedding>) -> TokenStreamAsync {
+        TokenStreamAsync::new(self.ask_with_embeddings_channel(text, embeddings))
     }
 
     /// Send a message and collect tokens as they arrive.
@@ -948,6 +981,11 @@ enum ChatMsg {
         prompt: Prompt,
         output_tx: tokio::sync::mpsc::UnboundedSender<llm::WriteOutput>,
     },
+    AskWithEmbeddings {
+        text: String,
+        embeddings: Vec<ImageEmbedding>,
+        output_tx: tokio::sync::mpsc::UnboundedSender<llm::WriteOutput>,
+    },
     ResetChat {
         system_prompt: Option<String>,
         tools: Vec<Tool>,
@@ -1000,6 +1038,11 @@ impl std::fmt::Debug for ChatMsg {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ChatMsg::Ask { prompt, .. } => f.debug_struct("Ask").field("text", prompt).finish(),
+            ChatMsg::AskWithEmbeddings { text, embeddings, .. } => f
+                .debug_struct("AskWithEmbeddings")
+                .field("text", text)
+                .field("n_embeddings", &embeddings.len())
+                .finish(),
             ChatMsg::ResetChat {
                 system_prompt,
                 tools,
@@ -1062,6 +1105,15 @@ fn process_worker_msg(
                 }
             };
             worker_state.ask(prompt, callback)?;
+        }
+        ChatMsg::AskWithEmbeddings { text, embeddings, output_tx } => {
+            let should_stop = Arc::clone(&worker_state.extra.should_stop);
+            let callback = move |out| {
+                if output_tx.send(out).is_err() {
+                    should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            };
+            worker_state.ask_with_embeddings(text, embeddings, callback).map_err(ChatWorkerError::from)?;
         }
         ChatMsg::ResetChat {
             system_prompt,
@@ -1701,6 +1753,54 @@ impl Worker<'_, ChatWorker> {
         self.add_assistant_message(response);
 
         self.extra.context.chunks = self.render_as_chunks(true)?;
+
+        Ok(self)
+    }
+
+    /// Phase 2 of two-phase inference: generate text using pre-computed image embeddings.
+    ///
+    /// Resets conversation state, feeds `embeddings` directly into the KV cache (no mmproj
+    /// required), then renders and feeds the text-only prompt before generating a response.
+    pub fn ask_with_embeddings<F>(
+        &mut self,
+        text: String,
+        mut embeddings: Vec<ImageEmbedding>,
+        respond: F,
+    ) -> Result<&mut Self, ChatWorkerError>
+    where
+        F: Fn(llm::WriteOutput) + Clone,
+    {
+        self.extra
+            .should_stop
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // Fresh context for stateless per-page generation.
+        self.reset_context();
+        // Add user message — text only, no image assets (images are pre-encoded).
+        self.add_user_message(text, vec![]);
+
+        // Render text-only prompt (no bitmaps → no image chunks).
+        let text_chunks = self.render_as_chunks(true)?;
+
+        let _gil_guard = GLOBAL_INFERENCE_LOCK.lock();
+        let lock = _gil_guard.unwrap();
+
+        // Feed embeddings before text so their positions come first in the KV cache.
+        for embedding in &mut embeddings {
+            self.read_precomputed_image_embedding(embedding, &lock)?;
+        }
+
+        // Feed text tokens directly — bypasses sync since KV was empty before embeddings.
+        for chunk in text_chunks.clone().into_iter() {
+            if let TokenizerChunk::Text(tokens, _) = chunk {
+                self.read_text_tokens(tokens, &lock)?;
+            }
+        }
+        // Record what's been cached so context-shift can reason about it later.
+        self.extra.context.chunks = text_chunks;
+
+        self.generate_response_until_done(self.extra.sampler_config.clone(), respond, &lock)
+            .map_err(SayError::GenerateResponse)?;
 
         Ok(self)
     }

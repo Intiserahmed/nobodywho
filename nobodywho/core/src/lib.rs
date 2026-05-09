@@ -9,6 +9,9 @@ pub mod template;
 pub mod tokenizer;
 pub mod tool_calling;
 
+#[cfg(test)]
+mod two_phase_test;
+
 pub fn send_llamacpp_logs_to_tracing() {
     llama_cpp_2::send_logs_to_tracing(llama_cpp_2::LogOptions::default().with_logs_enabled(true));
 }

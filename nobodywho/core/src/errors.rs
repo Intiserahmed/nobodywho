@@ -320,6 +320,9 @@ pub enum MultimodalError {
 
     #[error("Failed to set chunk ID for bitmap: {0}")]
     FailedToSetBitmapId(#[from] std::ffi::NulError),
+
+    #[error("Image encoding failed: {0}")]
+    EncodeImageFailed(String),
 }
 
 #[derive(Debug, thiserror::Error)]

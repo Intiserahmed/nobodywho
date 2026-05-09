@@ -8,8 +8,8 @@ use ahash::AHasher;
 use llama_cpp_2::{
     model::{AddBos, LlamaModel},
     mtmd::{
-        MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputChunkType, MtmdInputChunks,
-        MtmdInputText,
+        MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputChunk, MtmdInputChunkType,
+        MtmdInputChunks, MtmdInputText,
     },
     token::LlamaToken,
 };
@@ -432,6 +432,52 @@ impl ProjectionModel {
 
         Ok(bitmap)
     }
+
+    /// Phase 1 of two-phase inference: encode an image chunk into a self-contained embedding.
+    ///
+    /// After calling this for all images the `ProjectionModel` (mmproj, ~462MB) can be
+    /// dropped. The returned [`ImageEmbedding`] carries the float data AND the architecture
+    /// flags needed for Phase 2 decode, so no `MtmdContext` is needed after this call.
+    ///
+    /// `n_embd` must equal `language_model.n_embd_inp() as usize` for the paired main model.
+    pub fn encode_image_to_embedding(
+        &self,
+        chunk: &MtmdInputChunk,
+        n_embd: usize,
+    ) -> Result<ImageEmbedding, MultimodalError> {
+        let n_tokens = chunk.n_tokens();
+        let (nx, ny) = chunk.image_dims();
+        let use_non_causal = self.ctx.decode_use_non_causal(chunk);
+        let use_mrope = self.ctx.decode_use_mrope();
+        self.ctx
+            .encode_chunk(chunk)
+            .map_err(|e| MultimodalError::EncodeImageFailed(e.to_string()))?;
+        let data = self.ctx.get_output_embeddings(n_tokens, n_embd);
+        Ok(ImageEmbedding { data, n_tokens, n_embd, nx, ny, use_non_causal, use_mrope })
+    }
+}
+
+/// Pre-computed vision encoder output for a single image.
+///
+/// Produced in Phase 1 (encode, mmproj loaded) and consumed in Phase 2 (generate,
+/// mmproj unloaded). Carries float data AND architecture flags so the mmproj context
+/// can be fully dropped before Phase 2 generation.
+#[derive(Debug, Clone)]
+pub struct ImageEmbedding {
+    /// Raw floats from `mtmd_get_output_embd`, copied before next encode invalidates the buffer.
+    pub data: Vec<f32>,
+    /// Number of image tokens (`chunk.n_tokens()`).
+    pub n_tokens: usize,
+    /// Input embedding dimension (`language_model.n_embd_inp() as usize`).
+    pub n_embd: usize,
+    /// Spatial grid width in patches (M-RoPE 2-D position encoding).
+    pub nx: usize,
+    /// Spatial grid height in patches (M-RoPE 2-D position encoding).
+    pub ny: usize,
+    /// Whether the model needs non-causal (bidirectional) attention for vision tokens.
+    pub use_non_causal: bool,
+    /// Whether the model uses M-RoPE multimodal position encoding.
+    pub use_mrope: bool,
 }
 
 #[derive(Debug)]

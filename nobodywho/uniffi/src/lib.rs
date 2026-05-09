@@ -227,6 +227,30 @@ pub async fn load_model(
     }))
 }
 
+// ---------- RustImageEmbedding ----------
+// Opaque wrapper around a pre-computed vision encoder output.
+// Produced by `RustModel::encode_image` (Phase 1, mmproj loaded).
+// Consumed by `RustChat::ask_with_embeddings` (Phase 2, no mmproj needed).
+
+#[derive(uniffi::Object)]
+pub struct RustImageEmbedding {
+    inner: nobodywho::tokenizer::ImageEmbedding,
+}
+
+#[uniffi::export]
+impl RustModel {
+    /// Phase 1 of two-phase inference: encode an image into a self-contained embedding.
+    ///
+    /// The model must have been loaded with a `projection_model_path` (mmproj).
+    /// After encoding all images, drop this model to free ~462MB before Phase 2.
+    pub fn encode_image(&self, image_path: String) -> Result<Arc<RustImageEmbedding>, NobodyWhoError> {
+        let embedding = self.inner.encode_image(&image_path).map_err(|e| NobodyWhoError::Error {
+            message: e.to_string(),
+        })?;
+        Ok(Arc::new(RustImageEmbedding { inner: embedding }))
+    }
+}
+
 // ---------- RustChat ----------
 // Wrapper intended to be wrapped again in the target language (e.g. as `Chat`).
 
@@ -289,6 +313,22 @@ impl RustChat {
         }
         Arc::new(RustTokenStream {
             inner: tokio::sync::Mutex::new(self.inner.ask(prompt)),
+        })
+    }
+
+    /// Phase 2 of two-phase inference: generate text using pre-computed image embeddings.
+    ///
+    /// The model does NOT need a mmproj loaded — pass `projection_model_path: None` to
+    /// `load_model` for Phase 2 to save ~462MB of RAM.
+    pub fn ask_with_embeddings(
+        &self,
+        text: String,
+        embeddings: Vec<Arc<RustImageEmbedding>>,
+    ) -> Arc<RustTokenStream> {
+        let core_embeddings: Vec<nobodywho::tokenizer::ImageEmbedding> =
+            embeddings.into_iter().map(|e| e.inner.clone()).collect();
+        Arc::new(RustTokenStream {
+            inner: tokio::sync::Mutex::new(self.inner.ask_with_embeddings(text, core_embeddings)),
         })
     }
 

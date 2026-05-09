@@ -1,6 +1,6 @@
 use crate::errors::{InitWorkerError, LoadModelError, ReadError};
 use crate::memory;
-use crate::tokenizer::{ProjectionModel, Tokenizer, TokenizerChunk, TokenizerChunks};
+use crate::tokenizer::{ImageEmbedding, ProjectionModel, Tokenizer, TokenizerChunk, TokenizerChunks};
 use indicatif::{ProgressBar, ProgressStyle};
 use lazy_static::lazy_static;
 use llama_cpp_2::context::kv_cache::KvCacheConversionError;
@@ -112,6 +112,46 @@ where
 pub struct Model {
     pub(crate) language_model: LlamaModel,
     pub(crate) projection_model: Option<ProjectionModel>,
+}
+
+impl Model {
+    /// Phase 1 of two-phase inference: encode an image at `path` into a self-contained embedding.
+    ///
+    /// Requires the model to have been loaded with a mmproj (`projection_model_path`).
+    /// The returned [`ImageEmbedding`] can be passed to `Chat::ask_with_embeddings` after the
+    /// mmproj model (and any `Chat` holding it) has been dropped.
+    pub fn encode_image(&self, path: &str) -> Result<ImageEmbedding, crate::errors::MultimodalError> {
+        let projection_model = self
+            .projection_model
+            .as_ref()
+            .ok_or_else(|| crate::errors::MultimodalError::EncodeImageFailed(
+                "No projection model loaded — pass projection_model_path to load_model".into(),
+            ))?;
+        let n_embd = self.language_model.n_embd_inp() as usize;
+        let bitmap = projection_model.load_image(std::path::Path::new(path))?;
+        let chunk = projection_model.tokenize(&bitmap).map_err(|e| {
+            crate::errors::MultimodalError::EncodeImageFailed(e.to_string())
+        })?;
+        match chunk {
+            TokenizerChunk::Image(mtmd_chunks, _) | TokenizerChunk::Audio(mtmd_chunks, _) => {
+                // MtmdInputChunks may contain text + image + text wrappers.
+                // Find the first image/audio chunk — only that one produces embeddings.
+                use llama_cpp_2::mtmd::MtmdInputChunkType;
+                let image_chunk = (0..mtmd_chunks.len())
+                    .filter_map(|i| mtmd_chunks.get(i))
+                    .find(|c| matches!(c.chunk_type(), MtmdInputChunkType::Image | MtmdInputChunkType::Audio))
+                    .ok_or_else(|| {
+                        crate::errors::MultimodalError::EncodeImageFailed(
+                            "No image chunk found after tokenization".into(),
+                        )
+                    })?;
+                projection_model.encode_image_to_embedding(&image_chunk, n_embd)
+            }
+            TokenizerChunk::Text(_, _) => Err(crate::errors::MultimodalError::EncodeImageFailed(
+                "Image tokenized as text chunk unexpectedly".into(),
+            )),
+        }
+    }
 }
 
 pub fn has_gpu_backend() -> bool {
@@ -740,13 +780,83 @@ where
         Ok(self)
     }
 
+    /// Phase 2 of two-phase inference: feed pre-computed image embeddings into the KV cache.
+    ///
+    /// Does NOT require `MtmdContext` or a loaded mmproj — the architecture flags
+    /// (`use_non_causal`, `use_mrope`, `nx`, `ny`) are carried inside `embedding`.
+    /// The mmproj can be fully dropped after Phase 1 before calling this.
+    ///
+    /// Must be called under `GLOBAL_INFERENCE_LOCK`.
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub fn read_precomputed_image_embedding(
+        &mut self,
+        embedding: &mut ImageEmbedding,
+        _lock: &MutexGuard<'_, GlobalInferenceLockToken>,
+    ) -> Result<&mut Self, ReadError> {
+        let n_tokens = embedding.n_tokens;
+        let n_embd = embedding.n_embd;
+        debug!(n_tokens, n_embd, "Reading pre-computed image embedding:");
+
+        // Set non-causal attention if the model requires it for vision tokens.
+        if embedding.use_non_causal {
+            self.ctx.set_causal_attn(false);
+        }
+
+        // Build a llama_batch with the pre-computed embedding floats.
+        // n_batch size = n_tokens for the image, n_embd set so llama allocates the embd array.
+        let mut batch = LlamaBatch::new_with_embd(n_tokens, n_embd, 1);
+
+        if embedding.use_mrope {
+            // M-RoPE: 2-D spatial positions. Position layout: 4 values per token
+            // [temporal, row, col, 0] encoded as (n_past + row * nx + col) for col/row dims.
+            let nx = embedding.nx;
+            for i in 0..n_tokens {
+                let row = i / nx.max(1);
+                let col = i % nx.max(1);
+                // temporal pos = n_past (whole image occupies 1 temporal slot)
+                // spatial pos = row * nx + col (2-D grid position)
+                let pos = self.n_past + (row * nx + col) as i32;
+                batch.add_embd(
+                    &embedding.data[i * n_embd..(i + 1) * n_embd],
+                    pos,
+                    &[0],
+                    i == n_tokens - 1,
+                )?;
+            }
+        } else {
+            // Standard sequential positions.
+            for i in 0..n_tokens {
+                batch.add_embd(
+                    &embedding.data[i * n_embd..(i + 1) * n_embd],
+                    self.n_past + i as i32,
+                    &[0],
+                    i == n_tokens - 1,
+                )?;
+            }
+        }
+
+        self.ctx.decode(&mut batch).map_err(ReadError::Decode)?;
+
+        // All n_tokens occupy distinct KV slots (positions 0..n_tokens-1 relative to n_past).
+        // M-RoPE uses 2-D spatial positions within those slots but doesn't collapse them.
+        self.n_past += n_tokens as i32;
+
+        // Restore causal attention.
+        if embedding.use_non_causal {
+            self.ctx.set_causal_attn(true);
+        }
+
+        debug!("Pre-computed embedding read, n_past: {}", self.n_past);
+        Ok(self)
+    }
+
     // ---------- IMPORTANT ----------
     // Should only be used under a global inference lock
     // This is a safety meassure to prevent bugs from multiple
     // contexts with the same model. It might not be necessary
     // but assume it is.
     #[tracing::instrument(level = "trace", skip(self))]
-    fn read_text_tokens(
+    pub(crate) fn read_text_tokens(
         &mut self,
         tokens: Vec<LlamaToken>,
         inference_lock_token: &MutexGuard<'_, GlobalInferenceLockToken>,
